@@ -128,15 +128,17 @@ Expected behavior:
 - validate the CouchDB connection before accepting it
 - persist the registration in system metadata
 - keep the remove operation idempotent where practical
-- expose the current state of a managed table, including whether it is active, snapshotting, rebuilding, paused, or in error
+- expose the current state of a managed table, including whether it is active, snapshotting, rebuilding, swapping, paused, or in error
 - allow operators to inspect and update the active query limit settings
 
 Expected behavior for table state inspection:
 - return the canonical table name
 - return the current lifecycle state for that table
 - return whether a shadow table currently exists
+- return the current shadow table name when relevant
 - return the current snapshot or rebuild progress if one is running
 - return the last applied design revision and last processed source sequence for that table where available
+- return pending change count and processed row count when a snapshot or rebuild is active
 - return the last error message if the table is paused or failed
 
 ## Swagger And Endpoint Separation
@@ -257,7 +259,8 @@ Responsibilities of the admin database:
 - store encrypted CouchDB credentials
 - store query setting overrides made through the management API
 - store migration history
-- store future operational metadata required by synchronization
+- store source-level synchronization metadata such as listener sequences, last design revision, and source lifecycle state
+- store table-level synchronization metadata such as table lifecycle state, current snapshot mode, pending change count, processed row count, shadow-table presence, and last table error
 
 Migration approach:
 - migrations should be plain SQL scripts stored in the repository
@@ -292,6 +295,8 @@ Suggested initial components:
 - CouchDB connection validation service
 - credential encryption service
 - metadata repository for registered CouchDB sources
+- source synchronization metadata repository
+- table state metadata repository
 - query execution service with guardrails for limits and timeouts
 - query settings service for effective row-limit management
 - startup diagnostics and health reporting service
@@ -361,6 +366,8 @@ Deliverables:
 - implement SQL-script migration runner and migration history tracking
 - implement database discovery operations
 - implement metadata storage for registered CouchDB sources
+- implement source-level synchronization metadata storage
+- implement table-level synchronization metadata storage
 - implement encrypted CouchDB credential storage
 
 Exit criteria:
@@ -369,6 +376,7 @@ Exit criteria:
 - service applies pending admin database migrations automatically
 - service can list databases and tables
 - service can persist and read connection metadata
+- service can persist and read source and table synchronization state
 
 ### Phase 3: Query API
 
@@ -390,12 +398,14 @@ Exit criteria:
 Deliverables:
 - implement CouchDB registration endpoint
 - implement CouchDB removal endpoint
+- implement managed-table state endpoint
 - implement query settings management endpoint
 - validate CouchDB connectivity during registration
 - expose separate admin Swagger documentation locally
 
 Exit criteria:
 - new CouchDB sources can be registered and removed through localhost-only endpoints
+- operators can inspect managed table state, including rebuild and snapshot progress, through the localhost-only admin API
 - query-limit settings can be queried and updated locally through the management API
 - admin endpoints are absent from the main consumer Swagger surface
 
@@ -428,6 +438,9 @@ The following decisions are now fixed for the first delivery:
 7. Query row limits are controlled by configuration and can be updated through the management API.
 8. The service must create the admin metadata database if missing and apply pending SQL-script migrations automatically at startup.
 9. The service must use Serilog file logging, print startup state to the console, and expose a simple GET health endpoint.
+10. The service exposes a localhost-only managed-table state endpoint for snapshot, rebuild, and cutover visibility.
+11. The admin metadata database stores both source-level and table-level synchronization state.
+12. Sync batching and longpoll behavior use safe defaults from configuration and remain adjustable through appsettings.
 
 ## Recommended Outcome Of This Review
 
