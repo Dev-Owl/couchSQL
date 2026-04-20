@@ -1,0 +1,12 @@
+@CouchSqlPublic = http://127.0.0.1:8080
+@CouchSqlAdmin = http://127.0.0.1:8081
+
+GET {{CouchSqlPublic}}/api/v1/health
+Accept: application/json
+
+###
+
+GET {{CouchSqlAdmin}}/internal/v1/settings/query
+Accept: application/json
+
+###

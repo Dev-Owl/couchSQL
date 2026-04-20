@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CouchSql.Api/CouchSql.Api.csproj" />
+    <Project Path="src/CouchSql.Core/CouchSql.Core.csproj" />
+    <Project Path="src/CouchSql.Infrastructure/CouchSql.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CouchSql.Tests/CouchSql.Tests.csproj" />
+  </Folder>
+</Solution>
