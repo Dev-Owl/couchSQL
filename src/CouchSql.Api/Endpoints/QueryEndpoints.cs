@@ -12,16 +12,6 @@ public static class QueryEndpoints
             .WithGroupName("query")
             .WithTags("Query API");
 
-        group.MapGet("/health", (IStartupInitializer initializer) =>
-            TypedResults.Ok(new HealthResponse(
-                initializer.Current.Ready,
-                initializer.Current.PostgreSqlAvailable,
-                initializer.Current.AdminDatabaseReady,
-                initializer.Current.MigrationsApplied,
-                initializer.Current.EncryptionKeyReady,
-                initializer.Current.Messages)))
-            .WithName("GetHealth");
-
         group.MapGet("/databases", async (IAdminMetadataRepository repository, CancellationToken cancellationToken) =>
             {
                 var databases = await repository.GetManagedDatabasesAsync(cancellationToken);
@@ -46,6 +36,23 @@ public static class QueryEndpoints
                 return Results.Ok(new TableListResponse(databaseName, tables));
             })
             .WithName("GetDatabaseTables");
+
+        group.MapGet("/databases/{databaseName}/tables/{tableName}/structure", async (
+                string databaseName,
+                string tableName,
+                IAdminMetadataRepository repository,
+                IPostgreSqlService postgreSqlService,
+                CancellationToken cancellationToken) =>
+            {
+                if (!await repository.DatabaseIsManagedAsync(databaseName, cancellationToken))
+                {
+                    return Results.NotFound();
+                }
+
+                var structure = await postgreSqlService.GetTableStructureAsync(databaseName, tableName, cancellationToken);
+                return structure is null ? Results.NotFound() : Results.Ok(structure);
+            })
+            .WithName("GetTableStructure");
 
         group.MapPost("/query", async (
                 QueryRequest request,

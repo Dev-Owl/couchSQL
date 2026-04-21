@@ -122,23 +122,194 @@ public sealed class PostgreSqlService(
 
     public async Task DropTargetDatabaseAsync(string databaseName, CancellationToken cancellationToken)
     {
+        NpgsqlConnection.ClearAllPools();
         await using var connection = await OpenSystemConnectionAsync(cancellationToken);
-
-        const string terminateSql = """
-            select pg_terminate_backend(pid)
-            from pg_stat_activity
-            where datname = @databaseName and pid <> pg_backend_pid()
-            """;
-
-        await using (var terminateCommand = new NpgsqlCommand(terminateSql, connection))
-        {
-            terminateCommand.Parameters.AddWithValue("databaseName", databaseName);
-            await terminateCommand.ExecuteNonQueryAsync(cancellationToken);
-        }
 
         var dropSql = $"drop database if exists {QuoteIdentifier(databaseName)}";
         await using var dropCommand = new NpgsqlCommand(dropSql, connection);
-        await dropCommand.ExecuteNonQueryAsync(cancellationToken);
+
+        try
+        {
+            await dropCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+        catch (PostgresException exception) when (string.Equals(exception.SqlState, "55006", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"The target database '{databaseName}' is still in use by active PostgreSQL sessions. Close those sessions and try removing the connection again.",
+                exception);
+        }
+    }
+
+    public async Task DropManagedTablesAsync(string databaseName, IReadOnlyList<string> tableNames, CancellationToken cancellationToken)
+    {
+        if (tableNames.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        var joinedTableNames = string.Join(", ", tableNames.Select(QuoteIdentifier));
+        var sql = $"drop table if exists {joinedTableNames} cascade";
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task DropManagedColumnsAsync(string databaseName, string tableName, IReadOnlyList<string> columnNames, CancellationToken cancellationToken)
+    {
+        if (columnNames.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            foreach (var columnName in columnNames)
+            {
+                var sql = $"alter table {QuoteIdentifier(tableName)} drop column if exists {QuoteIdentifier(columnName)}";
+                await using var command = new NpgsqlCommand(sql, connection, transaction);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task RenameManagedColumnsAsync(string databaseName, string tableName, IReadOnlyDictionary<string, string> renamedColumns, CancellationToken cancellationToken)
+    {
+        if (renamedColumns.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            foreach (var rename in renamedColumns)
+            {
+                var sql = $"alter table {QuoteIdentifier(tableName)} rename column {QuoteIdentifier(rename.Key)} to {QuoteIdentifier(rename.Value)}";
+                await using var command = new NpgsqlCommand(sql, connection, transaction);
+                await command.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task ReplaceManagedIndexesAsync(
+        string databaseName,
+        string tableName,
+        IReadOnlyList<string> previousIndexNames,
+        IReadOnlyList<CouchSqlFieldDefinition> fields,
+        IReadOnlyList<CouchSqlIndexDefinition> desiredIndexes,
+        CancellationToken cancellationToken)
+    {
+        var indexNamesToDrop = previousIndexNames
+            .Concat(desiredIndexes.Select(index => index.Name))
+            .Where(indexName => !string.IsNullOrWhiteSpace(indexName))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (indexNamesToDrop.Length == 0 && desiredIndexes.Count == 0)
+        {
+            return;
+        }
+
+        var knownColumns = CreateKnownColumnMap(fields);
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            foreach (var indexName in indexNamesToDrop)
+            {
+                await using var dropCommand = new NpgsqlCommand($"drop index if exists {QuoteIdentifier(indexName!)}", connection, transaction);
+                await dropCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            foreach (var index in desiredIndexes)
+            {
+                var sql = BuildCreateIndexSql(tableName, index, knownColumns);
+                await using var createCommand = new NpgsqlCommand(sql, connection, transaction);
+                await createCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+    }
+
+    public async Task SwapShadowTablesAsync(string databaseName, IReadOnlyDictionary<string, string> shadowTablesByCanonicalTable, CancellationToken cancellationToken)
+    {
+        if (shadowTablesByCanonicalTable.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        var renamedOldTables = new List<string>();
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+
+        try
+        {
+            foreach (var pair in shadowTablesByCanonicalTable)
+            {
+                var canonicalTable = pair.Key;
+                var shadowTable = pair.Value;
+                var oldTable = canonicalTable + "_old";
+
+                var canonicalExists = await TableExistsAsync(connection, transaction, canonicalTable, cancellationToken);
+                if (canonicalExists)
+                {
+                    await using (var dropOldCommand = new NpgsqlCommand($"drop table if exists {QuoteIdentifier(oldTable)} cascade", connection, transaction))
+                    {
+                        await dropOldCommand.ExecuteNonQueryAsync(cancellationToken);
+                    }
+
+                    await using (var renameCanonicalCommand = new NpgsqlCommand($"alter table {QuoteIdentifier(canonicalTable)} rename to {QuoteIdentifier(oldTable)}", connection, transaction))
+                    {
+                        await renameCanonicalCommand.ExecuteNonQueryAsync(cancellationToken);
+                    }
+
+                    renamedOldTables.Add(oldTable);
+                }
+
+                await using (var renameShadowCommand = new NpgsqlCommand($"alter table {QuoteIdentifier(shadowTable)} rename to {QuoteIdentifier(canonicalTable)}", connection, transaction))
+                {
+                    await renameShadowCommand.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(cancellationToken);
+            throw;
+        }
+
+        if (renamedOldTables.Count > 0)
+        {
+            await DropManagedTablesAsync(databaseName, renamedOldTables, cancellationToken);
+        }
     }
 
     public async Task BuildInitialSchemaAsync(string databaseName, CouchSqlDesignDocument designDocument, CancellationToken cancellationToken)
@@ -150,6 +321,7 @@ public sealed class PostgreSqlService(
         foreach (var type in configuration.Types)
         {
             var tableName = type.Table ?? throw new InvalidOperationException("A design type is missing the table name.");
+            var knownColumns = CreateKnownColumnMap(type.Fields);
             var createTableSql = BuildCreateTableSql(tableName, type.Fields);
 
             await using (var createTableCommand = new NpgsqlCommand(createTableSql, connection))
@@ -157,13 +329,33 @@ public sealed class PostgreSqlService(
                 await createTableCommand.ExecuteNonQueryAsync(cancellationToken);
             }
 
+            foreach (var alterSql in BuildEnsureManagedColumnsSql(tableName, type.Fields))
+            {
+                await using var alterCommand = new NpgsqlCommand(alterSql, connection);
+                await alterCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
             foreach (var index in type.Indexes)
             {
-                var createIndexSql = BuildCreateIndexSql(tableName, index);
+                var createIndexSql = BuildCreateIndexSql(tableName, index, knownColumns);
                 await using var createIndexCommand = new NpgsqlCommand(createIndexSql, connection);
                 await createIndexCommand.ExecuteNonQueryAsync(cancellationToken);
             }
         }
+    }
+
+    public async Task TruncateManagedTablesAsync(string databaseName, IReadOnlyList<string> tableNames, CancellationToken cancellationToken)
+    {
+        if (tableNames.Count == 0)
+        {
+            return;
+        }
+
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+        var joinedTableNames = string.Join(", ", tableNames.Select(QuoteIdentifier));
+        var sql = $"truncate table {joinedTableNames}";
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     public async Task<IReadOnlyList<string>> GetTablesAsync(string databaseName, CancellationToken cancellationToken)
@@ -186,6 +378,71 @@ public sealed class PostgreSqlService(
         }
 
         return tables;
+    }
+
+    public async Task<TableStructureResponse?> GetTableStructureAsync(string databaseName, string tableName, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(databaseName, cancellationToken);
+
+        const string columnsSql = """
+            select
+                column_name,
+                udt_name,
+                is_nullable,
+                ordinal_position
+            from information_schema.columns
+            where table_schema = 'public' and lower(table_name) = lower(@tableName)
+            order by ordinal_position
+            """;
+
+        var columns = new List<TableColumnResponse>();
+        await using (var columnsCommand = new NpgsqlCommand(columnsSql, connection))
+        {
+            columnsCommand.Parameters.AddWithValue("tableName", tableName);
+            await using var reader = await columnsCommand.ExecuteReaderAsync(cancellationToken);
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                columns.Add(new TableColumnResponse(
+                    reader.GetString(0),
+                    MapInformationSchemaType(reader.GetString(1)),
+                    string.Equals(reader.GetString(2), "YES", StringComparison.OrdinalIgnoreCase),
+                    reader.GetInt32(3)));
+            }
+        }
+
+        if (columns.Count == 0)
+        {
+            return null;
+        }
+
+        const string indexesSql = """
+            select
+                indexname,
+                indexdef
+            from pg_indexes
+            where schemaname = 'public' and lower(tablename) = lower(@tableName)
+            order by indexname
+            """;
+
+        var indexes = new List<TableIndexResponse>();
+        await using (var indexesCommand = new NpgsqlCommand(indexesSql, connection))
+        {
+            indexesCommand.Parameters.AddWithValue("tableName", tableName);
+            await using var reader = await indexesCommand.ExecuteReaderAsync(cancellationToken);
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var indexName = reader.GetString(0);
+                var indexDefinition = reader.GetString(1);
+                indexes.Add(new TableIndexResponse(
+                    indexName,
+                    indexDefinition.Contains("create unique index", StringComparison.OrdinalIgnoreCase),
+                    ParseIndexedColumns(indexDefinition)));
+            }
+        }
+
+        return new TableStructureResponse(databaseName, tableName, columns, indexes);
     }
 
     public async Task<QueryExecutionResult> ExecuteSelectAsync(QueryRequest request, QuerySettingsState settings, CancellationToken cancellationToken)
@@ -245,6 +502,14 @@ public sealed class PostgreSqlService(
         return await command.ExecuteScalarAsync(cancellationToken) is not null;
     }
 
+    private static async Task<bool> TableExistsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string tableName, CancellationToken cancellationToken)
+    {
+        const string sql = "select to_regclass(@qualifiedTableName) is not null";
+        await using var command = new NpgsqlCommand(sql, connection, transaction);
+        command.Parameters.AddWithValue("qualifiedTableName", $"public.{QuoteIdentifier(tableName)}");
+        return await command.ExecuteScalarAsync(cancellationToken) as bool? == true;
+    }
+
     private async Task<NpgsqlConnection> OpenSystemConnectionAsync(CancellationToken cancellationToken)
     {
         return await OpenConnectionAsync(_options.SystemDatabase, cancellationToken);
@@ -279,7 +544,9 @@ public sealed class PostgreSqlService(
             .Append(QuoteIdentifier(tableName))
             .AppendLine(" (")
             .AppendLine("    \"_id\" text primary key,")
-            .AppendLine("    \"_rev\" text not null");
+            .AppendLine("    \"_rev\" text not null,")
+            .AppendLine("    \"_source_seq\" text not null,")
+            .AppendLine("    \"_synced_at\" timestamptz not null");
 
         foreach (var field in fields)
         {
@@ -298,10 +565,10 @@ public sealed class PostgreSqlService(
         return builder.ToString();
     }
 
-    private static string BuildCreateIndexSql(string tableName, CouchSqlIndexDefinition index)
+    private static string BuildCreateIndexSql(string tableName, CouchSqlIndexDefinition index, IReadOnlyDictionary<string, string> knownColumns)
     {
         var uniquePrefix = index.Unique ? "unique " : string.Empty;
-        var columns = string.Join(", ", index.Columns.Select(QuoteIdentifier));
+        var columns = string.Join(", ", index.Columns.Select(column => QuoteIdentifier(knownColumns[column])));
         return $"create {uniquePrefix}index if not exists {QuoteIdentifier(index.Name ?? string.Empty)} on {QuoteIdentifier(tableName)} ({columns})";
     }
 
@@ -314,6 +581,7 @@ public sealed class PostgreSqlService(
             "bigint" => "bigint",
             "numeric" => "numeric",
             "boolean" => "boolean",
+            "date" => "date",
             "timestamp" => "timestamp",
             "timestamptz" => "timestamptz",
             "jsonb" => "jsonb",
@@ -326,5 +594,70 @@ public sealed class PostgreSqlService(
     private static string QuoteIdentifier(string identifier)
     {
         return string.Concat('"', identifier.Replace("\"", "\"\"", StringComparison.Ordinal), '"');
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateKnownColumnMap(IReadOnlyCollection<CouchSqlFieldDefinition> fields)
+    {
+        var knownColumns = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["_id"] = "_id",
+            ["_rev"] = "_rev",
+            ["_source_seq"] = "_source_seq",
+            ["_synced_at"] = "_synced_at"
+        };
+
+        foreach (var field in fields)
+        {
+            if (!string.IsNullOrWhiteSpace(field.Column))
+            {
+                knownColumns[field.Column] = field.Column;
+            }
+        }
+
+        return knownColumns;
+    }
+
+    private static string MapInformationSchemaType(string udtName)
+    {
+        return udtName.ToLowerInvariant() switch
+        {
+            "int2" => "smallint",
+            "int4" => "integer",
+            "int8" => "bigint",
+            "float8" => "double precision",
+            "float4" => "real",
+            "bool" => "boolean",
+            "timestamp" => "timestamp",
+            "timestamptz" => "timestamptz",
+            _ => udtName
+        };
+    }
+
+    private static IReadOnlyList<string> ParseIndexedColumns(string indexDefinition)
+    {
+        var openParenIndex = indexDefinition.IndexOf('(');
+        var closeParenIndex = indexDefinition.LastIndexOf(')');
+        if (openParenIndex < 0 || closeParenIndex <= openParenIndex)
+        {
+            return Array.Empty<string>();
+        }
+
+        return indexDefinition[(openParenIndex + 1)..closeParenIndex]
+            .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(column => column.Trim().Trim('"'))
+            .ToArray();
+    }
+
+    private static IEnumerable<string> BuildEnsureManagedColumnsSql(string tableName, IReadOnlyCollection<CouchSqlFieldDefinition> fields)
+    {
+        yield return $"alter table {QuoteIdentifier(tableName)} add column if not exists \"_source_seq\" text not null default ''";
+        yield return $"alter table {QuoteIdentifier(tableName)} add column if not exists \"_synced_at\" timestamptz not null default now()";
+
+        foreach (var field in fields)
+        {
+            var columnName = QuoteIdentifier(field.Column ?? string.Empty);
+            var nullability = field.Required ? " not null" : string.Empty;
+            yield return $"alter table {QuoteIdentifier(tableName)} add column if not exists {columnName} {MapPostgreSqlType(field.Type ?? string.Empty)}{nullability}";
+        }
     }
 }

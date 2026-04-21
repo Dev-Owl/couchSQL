@@ -13,6 +13,23 @@ public sealed record ManagedDatabaseResponse(Guid ConnectionId, string DatabaseN
 
 public sealed record TableListResponse(string DatabaseName, IReadOnlyList<string> Tables);
 
+public sealed record TableStructureResponse(
+    string DatabaseName,
+    string TableName,
+    IReadOnlyList<TableColumnResponse> Columns,
+    IReadOnlyList<TableIndexResponse> Indexes);
+
+public sealed record TableColumnResponse(
+    string Name,
+    string PostgreSqlType,
+    bool Nullable,
+    int OrdinalPosition);
+
+public sealed record TableIndexResponse(
+    string Name,
+    bool Unique,
+    IReadOnlyList<string> Columns);
+
 public sealed record QuerySettingsResponse(int DefaultRowLimit, int MaxRowLimit, int CommandTimeoutSeconds);
 
 public sealed record UpdateQuerySettingsRequest(int DefaultRowLimit, int MaxRowLimit, int CommandTimeoutSeconds);
@@ -32,6 +49,11 @@ public sealed record RegisterCouchDbConnectionResponse(
     string DesignRevision,
     IReadOnlyList<string> Tables,
     string Status);
+
+public sealed record ForceResyncConnectionResponse(
+    Guid ConnectionId,
+    string Status,
+    string Message);
 
 public sealed record HealthResponse(
     bool Ready,

@@ -38,6 +38,26 @@ public sealed class DesignContractValidatorTests
         Assert.Contains("Unsupported identify predicate", exception.Message);
     }
 
+    [Fact]
+    public void Validate_Allows_Contains_On_Id()
+    {
+        var document = CreateValidDocument();
+        document.CouchSql!.Types[0].Identify = JsonDocument.Parse("{\"path\":\"_id\",\"contains\":\"component\"}").RootElement.Clone();
+
+        _validator.Validate(document);
+    }
+
+    [Fact]
+    public void Validate_Rejects_Empty_Field_Transform()
+    {
+        var document = CreateValidDocument();
+        document.CouchSql!.Types[0].Fields[0].Transform = new CouchSqlFieldTransformDefinition();
+
+        var exception = Assert.Throws<InvalidOperationException>(() => _validator.Validate(document));
+
+        Assert.Contains("transform must define", exception.Message);
+    }
+
     private static CouchSqlDesignDocument CreateValidDocument()
     {
         return new CouchSqlDesignDocument

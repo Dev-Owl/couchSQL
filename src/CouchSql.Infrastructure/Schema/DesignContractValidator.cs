@@ -13,6 +13,7 @@ public sealed class DesignContractValidator : IDesignContractValidator
         "bigint",
         "numeric",
         "boolean",
+        "date",
         "timestamp",
         "timestamptz",
         "jsonb",
@@ -87,6 +88,13 @@ public sealed class DesignContractValidator : IDesignContractValidator
             if (string.IsNullOrWhiteSpace(field.Type) || !SupportedPostgreSqlTypes.Contains(field.Type))
             {
                 throw new InvalidOperationException($"Field '{field.Column}' uses unsupported PostgreSQL type '{field.Type}'.");
+            }
+
+            if (field.Transform is not null
+                && string.IsNullOrEmpty(field.Transform.Prefix)
+                && string.IsNullOrEmpty(field.Transform.Append))
+            {
+                throw new InvalidOperationException($"Field '{field.Column}' transform must define a non-empty prefix or append value.");
             }
         }
 

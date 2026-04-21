@@ -1,4 +1,5 @@
 using CouchSql.Core.Contracts;
+using CouchSql.Core.Design;
 using CouchSql.Core.Interfaces;
 
 namespace CouchSql.Api.Endpoints;
@@ -10,6 +11,16 @@ public static class AdminEndpoints
         var group = endpoints.MapGroup("/internal/v1")
             .WithGroupName("admin")
             .WithTags("Admin API");
+
+        group.MapGet("/health", (IStartupInitializer initializer) =>
+            TypedResults.Ok(new HealthResponse(
+                initializer.Current.Ready,
+                initializer.Current.PostgreSqlAvailable,
+                initializer.Current.AdminDatabaseReady,
+                initializer.Current.MigrationsApplied,
+                initializer.Current.EncryptionKeyReady,
+                initializer.Current.Messages)))
+            .WithName("GetAdminHealth");
 
         group.MapPost("/couchdb/connections", async (
                 RegisterCouchDbConnectionRequest request,
@@ -33,10 +44,27 @@ public static class AdminEndpoints
                 IConnectionRemovalService removalService,
                 CancellationToken cancellationToken) =>
             {
-                await removalService.RemoveAsync(connectionId, cancellationToken);
-                return Results.NoContent();
+                try
+                {
+                    await removalService.RemoveAsync(connectionId, cancellationToken);
+                    return Results.NoContent();
+                }
+                catch (InvalidOperationException exception)
+                {
+                    return Results.Conflict(new { error = exception.Message });
+                }
             })
             .WithName("DeleteCouchDbConnection");
+
+        group.MapPost("/couchdb/connections/{connectionId:guid}/resync", async (
+                Guid connectionId,
+                IConnectionResyncService resyncService,
+                CancellationToken cancellationToken) =>
+            {
+                var response = await resyncService.ForceResyncAsync(connectionId, cancellationToken);
+                return response is null ? Results.NotFound() : Results.Ok(response);
+            })
+            .WithName("ForceResyncCouchDbConnection");
 
         group.MapGet("/couchdb/connections/{connectionId:guid}/tables/{tableName}/state", async (
                 Guid connectionId,
@@ -72,6 +100,31 @@ public static class AdminEndpoints
                 }
             })
             .WithName("UpdateQuerySettings");
+
+        group.MapGet("/design-documents", () => Results.Redirect("/internal/v1/design-documents/builder"))
+            .WithName("DesignDocumentBuilderRedirect");
+
+        group.MapGet("/design-documents/builder", () => Results.Content(AdminDesignDocumentBuilderPage.BuildHtml(AdminDesignDocumentBuilderPage.CreateSampleDocument()), "text/html"))
+            .WithName("DesignDocumentBuilderPage");
+
+        group.MapGet("/design-documents/template", () => Results.Json(AdminDesignDocumentBuilderPage.CreateSampleDocument()))
+            .WithName("GetDesignDocumentTemplate");
+
+        group.MapPost("/design-documents/validate", (
+                CouchSqlDesignDocument document,
+                IDesignContractValidator validator) =>
+            {
+                try
+                {
+                    validator.Validate(document);
+                    return Results.Ok(new { valid = true });
+                }
+                catch (InvalidOperationException exception)
+                {
+                    return Results.BadRequest(new { valid = false, error = exception.Message });
+                }
+            })
+            .WithName("ValidateDesignDocument");
 
         return endpoints;
     }

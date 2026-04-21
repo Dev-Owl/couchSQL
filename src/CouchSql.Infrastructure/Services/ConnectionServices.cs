@@ -6,6 +6,7 @@ using CouchSql.Core.Models;
 using CouchSql.Core.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using CouchSql.Infrastructure.Sync;
 
 namespace CouchSql.Infrastructure.Services;
 
@@ -15,6 +16,7 @@ public sealed class ConnectionRegistrationService(
     IPostgreSqlService postgreSqlService,
     IAdminMetadataRepository adminMetadataRepository,
     ICredentialProtector credentialProtector,
+    ISyncSupervisor syncSupervisor,
     IOptions<PostgreSqlOptions> postgreSqlOptions,
     ILogger<ConnectionRegistrationService> logger) : IConnectionRegistrationService
 {
@@ -80,13 +82,13 @@ public sealed class ConnectionRegistrationService(
         var tableStates = tableNames.Select(tableName => new TableStateRecord(
                 sourceId,
                 tableName,
-                "paused",
+                "snapshotting",
                 null,
                 false,
+                "initial-load",
                 null,
                 null,
-                null,
-                null,
+                0,
                 designRevision,
                 designRevision,
                 null,
@@ -94,6 +96,7 @@ public sealed class ConnectionRegistrationService(
             .ToArray();
 
         await adminMetadataRepository.SaveRegistrationAsync(source, credentials, listenerState, schemaState, tableStates, cancellationToken);
+        await syncSupervisor.EnqueueAsync(sourceId, cancellationToken);
 
         logger.LogInformation(
             "Registered CouchDB source {DatabaseName} at {BaseUrl} into PostgreSQL database {TargetDatabaseName}",
@@ -107,6 +110,8 @@ public sealed class ConnectionRegistrationService(
 
 public sealed class ConnectionRemovalService(
     IAdminMetadataRepository adminMetadataRepository,
+    SyncStateRepository syncStateRepository,
+    ISyncSupervisor syncSupervisor,
     IPostgreSqlService postgreSqlService,
     ILogger<ConnectionRemovalService> logger) : IConnectionRemovalService
 {
@@ -118,10 +123,42 @@ public sealed class ConnectionRemovalService(
             return;
         }
 
+        await syncStateRepository.UpdateSourceStatusAsync(sourceId, "paused", source.ActiveDesignRevision, cancellationToken);
+        await syncSupervisor.StopAsync(sourceId, cancellationToken);
         await postgreSqlService.DropTargetDatabaseAsync(source.TargetDatabaseName, cancellationToken);
         await adminMetadataRepository.RemoveSourceAsync(sourceId, cancellationToken);
 
         logger.LogInformation("Removed CouchDB source {SourceId} and dropped target database {TargetDatabaseName}", sourceId, source.TargetDatabaseName);
+    }
+}
+
+public sealed class ConnectionResyncService(
+    SyncStateRepository syncStateRepository,
+    IPostgreSqlService postgreSqlService,
+    ISyncSupervisor syncSupervisor,
+    ILogger<ConnectionResyncService> logger) : IConnectionResyncService
+{
+    public async Task<ForceResyncConnectionResponse?> ForceResyncAsync(Guid sourceId, CancellationToken cancellationToken)
+    {
+        var snapshot = await syncStateRepository.GetSourceAsync(sourceId, cancellationToken);
+        if (snapshot is null)
+        {
+            return null;
+        }
+
+        await postgreSqlService.TruncateManagedTablesAsync(
+            snapshot.Source.TargetDatabaseName,
+            syncStateRepository.ReadManagedTables(snapshot.SchemaState),
+            cancellationToken);
+        await syncStateRepository.ResetSourceForResyncAsync(sourceId, snapshot.Source.ActiveDesignRevision, cancellationToken);
+        await syncSupervisor.RestartAsync(sourceId, cancellationToken);
+
+        logger.LogInformation("Forced resync requested for CouchDB source {SourceId}", sourceId);
+
+        return new ForceResyncConnectionResponse(
+            sourceId,
+            "snapshotting",
+            "The source listener state was reset and a fresh snapshot has been queued.");
     }
 }
 

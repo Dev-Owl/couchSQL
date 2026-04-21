@@ -1,3 +1,4 @@
+using System.Text.Json;
 using CouchSql.Core.Contracts;
 using CouchSql.Core.Design;
 using CouchSql.Core.Models;
@@ -16,6 +17,20 @@ public interface ICouchDbClient
     Task ValidateDatabaseAsync(string baseUrl, string databaseName, string username, string passwordOrToken, CancellationToken cancellationToken);
 
     Task<CouchSqlDesignDocument> GetDesignDocumentAsync(string baseUrl, string databaseName, string username, string passwordOrToken, CancellationToken cancellationToken);
+
+    Task<CouchDbChangesResponse> GetChangesAsync(
+        string baseUrl,
+        string databaseName,
+        string username,
+        string passwordOrToken,
+        string since,
+        JsonElement selector,
+        string feed,
+        bool includeDocs,
+        int? limit,
+        int? seqInterval,
+        int? heartbeatMilliseconds,
+        CancellationToken cancellationToken);
 }
 
 public interface ICredentialProtector
@@ -72,9 +87,29 @@ public interface IPostgreSqlService
 
     Task DropTargetDatabaseAsync(string databaseName, CancellationToken cancellationToken);
 
+    Task DropManagedTablesAsync(string databaseName, IReadOnlyList<string> tableNames, CancellationToken cancellationToken);
+
+    Task DropManagedColumnsAsync(string databaseName, string tableName, IReadOnlyList<string> columnNames, CancellationToken cancellationToken);
+
+    Task RenameManagedColumnsAsync(string databaseName, string tableName, IReadOnlyDictionary<string, string> renamedColumns, CancellationToken cancellationToken);
+
+    Task ReplaceManagedIndexesAsync(
+        string databaseName,
+        string tableName,
+        IReadOnlyList<string> previousIndexNames,
+        IReadOnlyList<CouchSqlFieldDefinition> fields,
+        IReadOnlyList<CouchSqlIndexDefinition> desiredIndexes,
+        CancellationToken cancellationToken);
+
+    Task SwapShadowTablesAsync(string databaseName, IReadOnlyDictionary<string, string> shadowTablesByCanonicalTable, CancellationToken cancellationToken);
+
     Task BuildInitialSchemaAsync(string databaseName, CouchSqlDesignDocument designDocument, CancellationToken cancellationToken);
 
+    Task TruncateManagedTablesAsync(string databaseName, IReadOnlyList<string> tableNames, CancellationToken cancellationToken);
+
     Task<IReadOnlyList<string>> GetTablesAsync(string databaseName, CancellationToken cancellationToken);
+
+    Task<TableStructureResponse?> GetTableStructureAsync(string databaseName, string tableName, CancellationToken cancellationToken);
 
     Task<QueryExecutionResult> ExecuteSelectAsync(QueryRequest request, QuerySettingsState settings, CancellationToken cancellationToken);
 }
@@ -92,6 +127,11 @@ public interface IConnectionRegistrationService
 public interface IConnectionRemovalService
 {
     Task RemoveAsync(Guid sourceId, CancellationToken cancellationToken);
+}
+
+public interface IConnectionResyncService
+{
+    Task<ForceResyncConnectionResponse?> ForceResyncAsync(Guid sourceId, CancellationToken cancellationToken);
 }
 
 public interface IQuerySettingsService

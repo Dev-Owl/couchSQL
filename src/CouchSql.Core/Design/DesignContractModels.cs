@@ -55,6 +55,18 @@ public sealed class CouchSqlFieldDefinition
 
     [JsonPropertyName("required")]
     public bool Required { get; set; }
+
+    [JsonPropertyName("transform")]
+    public CouchSqlFieldTransformDefinition? Transform { get; set; }
+}
+
+public sealed class CouchSqlFieldTransformDefinition
+{
+    [JsonPropertyName("prefix")]
+    public string? Prefix { get; set; }
+
+    [JsonPropertyName("append")]
+    public string? Append { get; set; }
 }
 
 public sealed class CouchSqlIndexDefinition
